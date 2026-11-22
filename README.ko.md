@@ -28,6 +28,8 @@ OpenAI 호환. BYOK. 단일 작업 공간. 스트리밍. `모델="자동"`.
 - [Tiếng Viet](./README.vi.md)
 - [힌디어](./README.hi.md)
 
+**관련 제품:** [전체 모델 API](https://www.orcarouter.ai/models) · [OrcaCode Review](https://www.orcarouter.ai/code-review) · [OrcaReplay](https://github.com/Continuum-AI-Corp/OrcaReplay) · [OrcaPromptVault](https://github.com/Continuum-AI-Corp/OrcaPromptVault)
+
 OrcaRouter Lite는 [OrcaRouter](https://www.orcarouter.ai)의 오픈 소스 단일 작업 공간 버전입니다. 랩톱에서 실행하거나, 제품에 포함하여 배송하거나, 키를 관리하고 싶지 않은 모델의 롱테일에 직접 호스팅된 `api.orcarouter.ai`를 사용하세요.
 
 > **왜 우리인가요?** LiteLLM은 도서관입니다. OpenRouter는 비공개 소스로 호스팅됩니다. Ollama는 로컬 전용입니다. 우리는 **관리형 대체 기능을 갖춘 자체 호스팅 서버**입니다. 누구도 말할 수 없는 문장입니다.
@@ -252,7 +254,7 @@ x-orca-cache: HIT          ← served from cache, no upstream call
 
 ### 통합
 
-[Claude Code](./integrations/claude-code.md), [Gemini SDK](./integrations/gemini-sdk.md), [Continue.dev](./integrations/continue.json), [Aider](./integrations/aider.md), [Cursor](./integrations/cursor.md), [LangChain](./integrations/langchain_orcarouter.py), [LlamaIndex](./integrations/llamaindex_orcarouter.py), [Vercel AI에 대한 드롭인 구성 SDK](./integrations/vercel_ai.ts) 및 OpenAI Chat Completions 프로토콜을 말하는 모든 도구입니다 — 여기에 네이티브 Anthropic 및 Gemini 와이어 형식도 추가됩니다. [`통합/`](./integrations/)을 참조하세요.
+[Claude Code](./integrations/claude-code.md), [Gemini SDK](./integrations/gemini-sdk.md), [Continue.dev](./integrations/continue.json), [Aider](./integrations/aider.md), [Cursor](./integrations/cursor.md), [LangChain](./integrations/langchain_orcarouter.py), [LlamaIndex](./integrations/llamaindex_orcarouter.py), [Vercel AI SDK](./integrations/vercel_ai.ts) 및 OpenAI Chat Completions 프로토콜을 사용하는 모든 도구를 위한 드롭인 구성 — 여기에 네이티브 Anthropic 및 Gemini 와이어 형식도 추가됩니다. [`integrations/`](./integrations/)을 참조하세요.
 
 ## 고의로 하지 않은 것
 

@@ -117,6 +117,133 @@ async def test_chat_completion_invokes_router_with_normalized_request(chat_clien
     assert call.kwargs["messages"][0]["content"] == "hi"
 
 
+async def test_chat_completion_forwards_parallel_tool_calls_false(chat_client):
+    """Regression for #124: `parallel_tool_calls=false` must survive the
+    schema and `model_dump(exclude_none=True)` into the LiteLLM call.
+
+    The field is falsy, so a missing schema declaration (or an accidental
+    truthy filter) silently drops it and the upstream still returns
+    parallel tool calls. False is not None, so exclude_none must keep it.
+    """
+    client, fake = chat_client
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_time",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+    ]
+    r = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "weather in Tokyo and the time?"}],
+            "tools": tools,
+            "parallel_tool_calls": False,
+        },
+    )
+    assert r.status_code == 200, r.text
+    fake.acompletion.assert_awaited_once()
+    call_kwargs = fake.acompletion.await_args.kwargs
+    assert "parallel_tool_calls" in call_kwargs, (
+        "parallel_tool_calls=False was stripped before the LiteLLM call"
+    )
+    assert call_kwargs["parallel_tool_calls"] is False
+    assert call_kwargs["tools"] == tools
+
+
+async def test_chat_completion_omits_parallel_tool_calls_when_unset(chat_client):
+    """Absent `parallel_tool_calls` must not be injected as None/False."""
+    client, fake = chat_client
+    await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    call_kwargs = fake.acompletion.await_args.kwargs
+    assert "parallel_tool_calls" not in call_kwargs
+
+
+async def test_chat_completion_forwards_langchain_json_schema(chat_client):
+    """Regression for #132: LangChain `method="json_schema"` must reach LiteLLM
+    as a well-formed OpenAI structured-outputs block, not a shape that
+    upstream rejects as `Invalid schema for response_format`.
+    """
+    client, fake = chat_client
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "MovieReview",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "rating": {"type": "number"},
+                    "summary": {"type": "string"},
+                },
+                "required": ["title", "rating", "summary"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    r = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "Review the movie Dune 2"}],
+            "response_format": response_format,
+        },
+    )
+    assert r.status_code == 200, r.text
+    fake.acompletion.assert_awaited_once()
+    rf = fake.acompletion.await_args.kwargs["response_format"]
+    assert rf["type"] == "json_schema"
+    assert rf["json_schema"]["name"] == "MovieReview"
+    assert rf["json_schema"]["strict"] is True
+    assert rf["json_schema"]["schema"]["additionalProperties"] is False
+    assert rf["json_schema"]["schema"]["required"] == ["title", "rating", "summary"]
+
+
+async def test_chat_completion_normalizes_misplaced_json_schema_strict(chat_client):
+    """`strict` beside `type` is the LiteLLM-docs spelling; OpenAI 400s it."""
+    client, fake = chat_client
+    r = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "Review the movie Dune 2"}],
+            "response_format": {
+                "type": "json_schema",
+                "strict": True,
+                "json_schema": {
+                    "name": "MovieReview",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"title": {"type": "string"}},
+                    },
+                },
+            },
+        },
+    )
+    assert r.status_code == 200, r.text
+    rf = fake.acompletion.await_args.kwargs["response_format"]
+    assert "strict" not in rf
+    assert rf["json_schema"]["strict"] is True
+    assert rf["json_schema"]["schema"]["additionalProperties"] is False
+
+
 async def test_chat_completion_writes_request_log(chat_client):
     client, _fake = chat_client
     await client.post(
@@ -143,6 +270,7 @@ async def test_chat_completion_writes_request_log(chat_client):
     assert log.input_tokens == 5
     assert log.output_tokens == 2
     assert log.status_code == 200
+    assert log.fallback_level == 0
 
 
 async def test_chat_completion_validation_error_for_empty_messages(chat_client):
@@ -153,6 +281,42 @@ async def test_chat_completion_validation_error_for_empty_messages(chat_client):
     )
     assert r.status_code == 422
     assert r.json()["error"]["type"] == "validation_error"
+
+
+async def test_chat_completion_blocking_httpexception_logs_real_status(chat_client):
+    """The blocking path's `except HTTPException` arm records the raised status
+    instead of leaving the handler-local 200, so the finally cannot write a
+    success-shaped row for a failed request.
+
+    The exception is injected directly: the adapter translates every upstream
+    failure into UpstreamProviderError, so this shape is not reachable from real
+    traffic today. The test pins the handler's arm logic, not a live bug.
+    """
+    from fastapi import HTTPException
+
+    client, fake = chat_client
+    fake.acompletion = AsyncMock(
+        side_effect=HTTPException(status_code=429, detail="local key rate limited")
+    )
+
+    r = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert r.status_code == 429
+
+    from sqlalchemy import select
+
+    from packages.db import session as session_mod
+    from packages.db.models.request_log import RequestLog
+
+    async with session_mod._session_factory() as s:
+        log = (await s.execute(select(RequestLog))).scalars().one()
+    assert log.status_code == 429
+    assert log.cost_microcents == 0
 
 
 async def test_chat_completion_logs_active_strategy(chat_client):
@@ -181,3 +345,67 @@ async def test_chat_completion_logs_active_strategy(chat_client):
     async with session_mod._session_factory() as s:
         log = (await s.execute(select(RequestLog))).scalars().one()
     assert log.routing_strategy == "cheapest"
+
+
+async def test_chat_completion_no_fallback_header_on_local_hit(chat_client):
+    """Local BYOK success must not look like a hosted bypass."""
+    client, _fake = chat_client
+    r = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert r.status_code == 200
+    assert "x-orca-fallback" not in r.headers
+
+
+async def test_chat_completion_signals_hosted_fallback_after_local_429(chat_client):
+    """Issue #140: hosted serving a model the local key covers must set
+    `x-orca-fallback: true` and record orcarouter + fallback_level=1 so
+    the dashboard can tell BYOK was bypassed (typically after a 429
+    cooldown) instead of looking like a normal local completion.
+    """
+    client, fake = chat_client
+    fake.acompletion.return_value = {
+        "id": "chatcmpl-hosted-fb",
+        "model": "gpt-4o-mini",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "from hosted"},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+        "_orca_meta": {
+            "provider": "orcarouter",
+            "fallback": True,
+            "latency_ms": 88,
+        },
+    }
+
+    r = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert r.headers.get("x-orca-fallback") == "true"
+    assert r.headers.get("x-orca-resolved-model") == "gpt-4o-mini"
+    # Internal meta must not leak onto the OpenAI wire body.
+    assert "_orca_meta" not in r.json()
+
+    from sqlalchemy import select
+
+    from packages.db import session as session_mod
+    from packages.db.models.request_log import RequestLog
+
+    async with session_mod._session_factory() as s:
+        log = (await s.execute(select(RequestLog))).scalars().one()
+    assert log.provider == "orcarouter"
+    assert log.fallback_level == 1
+    assert log.model_resolved == "gpt-4o-mini"

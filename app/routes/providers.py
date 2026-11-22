@@ -46,11 +46,20 @@ from app import cache_invalidation_bus
 from app.config import get_settings
 from app.deps import get_db, get_key_context
 from app.router_cache import usable_providers_from_db
-from packages.auth.encryption import encrypt_credential
+from packages.auth.encryption import credential_is_decryptable, encrypt_credential
+from packages.auth.guards import require_unrestricted
 from packages.auth.types import KeyContext
 from packages.db.models.provider_key import ProviderKey
 
 router = APIRouter(prefix="/v1/providers", tags=["providers"])
+
+# Dashboard sends this literal when the operator saves the provider form
+# without retyping the secret (masked display value round-trips as "no change").
+DASHBOARD_KEY_PLACEHOLDER = "[REDACTED]"
+
+
+def _is_dashboard_key_placeholder(api_key: str) -> bool:
+    return api_key == DASHBOARD_KEY_PLACEHOLDER
 
 
 class SetProviderKey(BaseModel):
@@ -64,6 +73,21 @@ class ProviderKeyOut(BaseModel):
     # "db" = stored in provider_keys table (editable + deletable from dashboard)
     # "env" = loaded from .env / process env (read-only here; edit .env to change)
     source: str = "db"
+    # False when the stored ciphertext does not open with the current
+    # CREDENTIAL_ENCRYPTION_KEY (typical after a key rotation). Env rows
+    # are always decryptable — they are not sealed.
+    decryptable: bool = True
+    warnings: list[str] = []
+
+
+def _dump_provider_key(out: ProviderKeyOut) -> dict:
+    """Serialize a provider-key payload. Empty `warnings` are omitted so
+    list responses and matching-prefix PUTs stay compatible with the
+    pre-warning API (`warnings` only appears when there is one)."""
+    payload = out.model_dump()
+    if not payload["warnings"]:
+        del payload["warnings"]
+    return payload
 
 
 def _mask_key(api_key: str) -> str:
@@ -75,6 +99,69 @@ def _mask_key(api_key: str) -> str:
     if len(api_key) > 4:
         return api_key[:2] + "..." + api_key[-2:]
     return "..."
+
+
+# Soft prefix checks for known upstreams. Unknown providers are not guessed
+# at — BYOK can be anything. A miss here is a WARNING on PUT, never a
+# rejection: unusual-but-valid keys must still store. Together is omitted
+# because live keys are not a stable prefix (historically hex, now mixed)
+# and a false warning is noisier than silence there.
+_KNOWN_KEY_PREFIXES: dict[str, tuple[str, ...]] = {
+    "openai": ("sk-",),
+    "anthropic": ("sk-ant-",),
+    "groq": ("gsk_",),
+    "xai": ("xai-",),
+    "deepseek": ("sk-",),
+    "fireworks": ("fw_",),
+    "orcarouter": ("sk-orca-",),
+}
+
+_PROVIDER_DISPLAY = {
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+    "google": "Google",
+    "groq": "Groq",
+    "xai": "xAI",
+    "deepseek": "DeepSeek",
+    "fireworks": "Fireworks",
+    "orcarouter": "OrcaRouter",
+}
+
+
+def _google_key_matches(key: str) -> bool:
+    """Google keys are either an AI Studio / Cloud API key (`AIza…`) or a
+    service-account JSON blob (starts with `{`)."""
+    return key.startswith("AIza") or key.startswith("{")
+
+
+def provider_key_format_warning(provider: str, api_key: str) -> str | None:
+    """Return a warning if `api_key` is obviously the wrong shape for a
+    known provider. `None` means "looks fine" or "provider is unknown —
+    don't guess". The caller still stores the key either way."""
+    key = api_key.strip()
+    if _is_dashboard_key_placeholder(key):
+        return None
+    slug = provider.strip().lower()
+    if slug == "google":
+        if _google_key_matches(key):
+            return None
+        expected = "'AIza...' or service-account JSON"
+    else:
+        prefixes = _KNOWN_KEY_PREFIXES.get(slug)
+        if not prefixes:
+            return None
+        if any(key.startswith(p) for p in prefixes):
+            return None
+        expected = " or ".join(f"'{p}...'" for p in prefixes)
+
+    # Never echo a short secret in full — 5 chars of a 5-char key is the
+    # whole credential. Longer keys still get a tiny identifying prefix.
+    shown = key[:5] if len(key) > 5 else "<too-short>"
+    label = _PROVIDER_DISPLAY.get(slug, slug)
+    return (
+        f"Key prefix '{shown}' doesn't match known {label} format "
+        f"(expected {expected}). Verify this is correct."
+    )
 
 
 @router.get("")
@@ -107,12 +194,15 @@ async def list_providers(
         # to render appropriately; the env-suppression check below is the
         # part that depends on USABILITY, not just presence.
         out.append(
-            ProviderKeyOut(
-                provider=r.provider,
-                key_prefix=r.key_prefix,
-                is_enabled=r.is_enabled,
-                source="db",
-            ).model_dump()
+            _dump_provider_key(
+                ProviderKeyOut(
+                    provider=r.provider,
+                    key_prefix=r.key_prefix,
+                    is_enabled=r.is_enabled,
+                    source="db",
+                    decryptable=credential_is_decryptable(r.encrypted_key),
+                )
+            )
         )
 
     # Surface env-configured keys the runtime is already using. DB takes
@@ -125,12 +215,15 @@ async def list_providers(
         if prov in usable_db:
             continue
         out.append(
-            ProviderKeyOut(
-                provider=prov,
-                key_prefix=_mask_key(raw_key),
-                is_enabled=True,
-                source="env",
-            ).model_dump()
+            _dump_provider_key(
+                ProviderKeyOut(
+                    provider=prov,
+                    key_prefix=_mask_key(raw_key),
+                    is_enabled=True,
+                    source="env",
+                    decryptable=True,
+                )
+            )
         )
 
     return {"providers": out}
@@ -141,9 +234,11 @@ async def set_provider_key(
     provider: str,
     body: SetProviderKey,
     _kc: KeyContext = Depends(get_key_context),
+    _restricted: None = Depends(require_unrestricted),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    if not body.api_key.strip():
+    api_key = body.api_key.strip()
+    if not api_key:
         raise HTTPException(status_code=422, detail="api_key cannot be empty")
 
     # Wipe any soft-deleted ghost rows for this provider before upsert.
@@ -168,8 +263,27 @@ async def set_provider_key(
         )
     ).scalar_one_or_none()
 
-    encrypted = encrypt_credential(body.api_key)
-    prefix_visible = _mask_key(body.api_key)
+    if _is_dashboard_key_placeholder(api_key):
+        if existing is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "api_key cannot be the dashboard placeholder when no "
+                    "stored key exists for this provider"
+                ),
+            )
+        return _dump_provider_key(
+            ProviderKeyOut(
+                provider=existing.provider,
+                key_prefix=existing.key_prefix,
+                is_enabled=existing.is_enabled,
+                source="db",
+                decryptable=True,
+            )
+        )
+
+    encrypted = encrypt_credential(api_key)
+    prefix_visible = _mask_key(api_key)
 
     if existing is not None:
         existing.encrypted_key = encrypted
@@ -186,18 +300,26 @@ async def set_provider_key(
     await db.commit()
     await cache_invalidation_bus.broadcast_router_cache_invalidation()
 
-    return ProviderKeyOut(
-        provider=existing.provider,
-        key_prefix=existing.key_prefix,
-        is_enabled=existing.is_enabled,
-        source="db",
-    ).model_dump()
+    # Soft format check: store anyway (BYOK), but tell the operator at
+    # write time so an obvious typo doesn't surface later as a 401/cooldown.
+    warning = provider_key_format_warning(provider, api_key)
+    return _dump_provider_key(
+        ProviderKeyOut(
+            provider=existing.provider,
+            key_prefix=existing.key_prefix,
+            is_enabled=existing.is_enabled,
+            source="db",
+            decryptable=True,
+            warnings=[warning] if warning else [],
+        )
+    )
 
 
 @router.delete("/{provider}", status_code=204)
 async def delete_provider_key(
     provider: str,
     _kc: KeyContext = Depends(get_key_context),
+    _restricted: None = Depends(require_unrestricted),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
     """Hard-delete the DB row for this provider. After this, runtime

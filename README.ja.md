@@ -28,6 +28,8 @@ OpenAI対応。ビヨク。単一のワークスペース。ストリーミン�
 - [Tiếng Việt](./README.vi.md)
 - [हिन्दी](./README.hi.md)
 
+**関連プロダクト：**[すべてのモデル API](https://www.orcarouter.ai/models) · [OrcaCode Review](https://www.orcarouter.ai/code-review) · [OrcaReplay](https://github.com/Continuum-AI-Corp/OrcaReplay) · [OrcaPromptVault](https://github.com/Continuum-AI-Corp/OrcaPromptVault)
+
 OrcaRouter Lite は、[OrcaRouter](https://www.orcarouter.ai) のオープンソースの単一ワークスペース エディションです。ラップトップで実行するか、製品に同梱するか、キーを管理したくないモデルのロングテールに対してホストされた「api.orcarouter.ai」を直接使用します。
 
 > **なぜ当社なのか?** LiteLLM はライブラリです。 OpenRouter はクローズドソースでホストされています。オラマは地元限定です。私たちは**管理されたフォールバックを備えた自己ホスト型サーバー**です。これは誰にも言えない言葉です。
@@ -252,7 +254,7 @@ x-orca-cache: HIT          ← served from cache, no upstream call
 
 ### 統合
 
-[Claude Code](./integrations/claude-code.md)、[Gemini SDK](./integrations/gemini-sdk.md)、[Continue.dev](./integrations/ continue.json)、[Aider](./integrations/aider.md)、[Cursor](./integrations/cursor.md)、[LangChain](./integrations/langchain_orcarouter.py)、[LlamaIndex](./integrations/llamaindex_orcarouter.py)、[Vercel AI] のドロップイン構成SDK](./integrations/vercel_ai.ts)、および OpenAI Chat Completions プロトコルを使用するツール — さらにネイティブの Anthropic および Gemini ワイヤー フォーマットにも対応します。 [`integrations/`](./integrations/) を参照してください。
+[Claude Code](./integrations/claude-code.md)、[Gemini SDK](./integrations/gemini-sdk.md)、[Continue.dev](./integrations/continue.json)、[Aider](./integrations/aider.md)、[Cursor](./integrations/cursor.md)、[LangChain](./integrations/langchain_orcarouter.py)、[LlamaIndex](./integrations/llamaindex_orcarouter.py)、[Vercel AI SDK](./integrations/vercel_ai.ts)、および OpenAI Chat Completions プロトコルを使用するツール向けのドロップイン構成 — さらにネイティブの Anthropic および Gemini ワイヤー フォーマットにも対応します。 [`integrations/`](./integrations/) を参照してください。
 
 ## 意図的にそうでないもの
 

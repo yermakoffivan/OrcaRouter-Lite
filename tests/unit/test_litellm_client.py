@@ -101,6 +101,82 @@ async def test_acompletion_stream_returns_async_iterable_not_dict(fake_router_wi
     assert len(chunks) == 2
 
 
+async def test_acompletion_forwards_parallel_tool_calls_false(fake_router_with_stream):
+    """Issue #124: `parallel_tool_calls=False` must reach LiteLLM Router
+    kwargs as False, not be dropped as a falsy value."""
+    await fake_router_with_stream.acompletion(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[{"type": "function", "function": {"name": "get_weather"}}],
+        parallel_tool_calls=False,
+    )
+    call = fake_router_with_stream._router.acompletion.await_args
+    assert call.kwargs["parallel_tool_calls"] is False
+
+
+async def test_acompletion_forwards_json_schema_response_format(fake_router_with_stream):
+    """Issue #132: LangChain json_schema `response_format` must reach the
+    LiteLLM Router kwargs intact (strict + nested schema)."""
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "MovieReview",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"title": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        },
+    }
+    await fake_router_with_stream.acompletion(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "hi"}],
+        response_format=response_format,
+    )
+    call = fake_router_with_stream._router.acompletion.await_args
+    assert call.kwargs["response_format"] == response_format
+
+
+async def test_openai_deployments_advertise_response_schema(monkeypatch):
+    """LiteLLM uses model_info.supports_response_schema to decide whether
+    to pass json_schema through or re-wrap it. OpenAI-compatible
+    deployments must advertise support so LangChain structured output
+    is not rewritten into an invalid schema."""
+    import litellm
+
+    from packages.litellm_adapter.client import OrcaLiteLLMClient
+    from packages.litellm_adapter.types import ProviderDeployment
+
+    captured: dict = {}
+
+    def _router(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(litellm, "Router", _router)
+
+    OrcaLiteLLMClient(
+        deployments=[
+            ProviderDeployment(
+                model_name="gpt-4o-mini",
+                litellm_model="openai/gpt-4o-mini",
+                api_key="sk-test",
+                provider="openai",
+            ),
+            ProviderDeployment(
+                model_name="claude-3-5-sonnet-latest",
+                litellm_model="anthropic/claude-3-5-sonnet-latest",
+                api_key="sk-test",
+                provider="anthropic",
+            ),
+        ]
+    )
+    by_name = {e["model_name"]: e for e in captured["model_list"]}
+    assert by_name["gpt-4o-mini"]["model_info"]["supports_response_schema"] is True
+    assert "supports_response_schema" not in (by_name["claude-3-5-sonnet-latest"].get("model_info") or {})
+
+
 async def test_acompletion_non_stream_returns_dict_with_orca_meta(fake_router_with_stream):
     """Non-stream path must keep returning a dict with the _orca_meta
     injection — that's the contract the existing chat.py blocking path
@@ -220,6 +296,64 @@ async def test_acompletion_orca_meta_cost_none_when_litellm_omits_it(monkeypatch
     assert result["_orca_meta"]["cost_usd"] is None
     # Provider attribution falls back to deployment-loop lookup.
     assert result["_orca_meta"]["provider"] == "openai"
+
+
+async def test_acompletion_marks_hosted_fallback_when_local_key_is_bypassed(monkeypatch):
+    """Issue #140: after a local 429 cools the BYOK deployment, LiteLLM
+    serves the hosted peer. custom_llm_provider stays "openai" (that's how
+    the hosted entry is wired), so the adapter must recover the source
+    from the pinned `hosted::` model_id and flag `_orca_meta.fallback`.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    import litellm
+
+    from packages.litellm_adapter.client import OrcaLiteLLMClient
+    from packages.litellm_adapter.types import ProviderDeployment
+
+    class _HostedResponse:
+        model = "gpt-4o-mini"
+        _hidden_params = {
+            "response_cost": 0.000_012,
+            "custom_llm_provider": "openai",
+            "model_id": "hosted::openai/gpt-4o-mini",
+            "api_base": "https://api.orcarouter.ai/v1",
+        }
+
+        def model_dump(self):
+            return {"model": self.model, "choices": [], "usage": {}}
+
+    fake_router = MagicMock()
+    fake_router.acompletion = AsyncMock(side_effect=lambda **_: _HostedResponse())
+    monkeypatch.setattr(litellm, "Router", lambda **_: fake_router)
+
+    client = OrcaLiteLLMClient(
+        deployments=[
+            ProviderDeployment(
+                model_name="gpt-4o-mini", litellm_model="openai/gpt-4o-mini",
+                api_key="sk-local", provider="openai",
+            ),
+            ProviderDeployment(
+                model_name="gpt-4o-mini", litellm_model="openai/gpt-4o-mini",
+                api_key="sk-orca", api_base="https://api.orcarouter.ai/v1",
+                provider="orcarouter", custom_llm_provider="openai",
+                deployment_id="hosted::openai/gpt-4o-mini",
+            ),
+        ],
+        strategy="balanced",
+        cooldown_time=0,
+    )
+    result = await client.acompletion(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    meta = result["_orca_meta"]
+    assert meta["provider"] == "orcarouter", (
+        "hosted traffic must not stay attributed as openai — that's the "
+        "analytics gap that hid the BYOK rate-limit"
+    )
+    assert meta.get("fallback") is True
+    assert meta.get("cost_usd") == 0.000_012
 
 
 async def test_acompletion_stream_raises_no_providers_when_router_is_none():
